@@ -28,6 +28,7 @@ from kimodo.viz.viser_utils import (
 from viser.theme import TitlebarButton, TitlebarConfig, TitlebarImage
 
 from . import generation, ui
+from .ai_split import split_action_text
 from .config import (
     DARK_THEME,
     DEFAULT_CUR_DURATION,
@@ -343,6 +344,87 @@ class Demo:
 
         # Initialize default character for this client
         self.add_character_motion(client, session.skeleton)
+
+        # --- AI keyframe splitting: describe poses in text, auto-place
+        #     full-body keyframe constraints on the timeline.
+        with client.gui.add_folder("AI Keyframes", expand_by_default=False):
+            ai_text_input = client.gui.add_text(
+                "Describe poses",
+                "先站立举手，然后蹲下，最后单脚踢腿",
+            )
+            ai_button = client.gui.add_button("AI 拆分并放置关键帧")
+
+        def _ai_place_keyframes(event):
+            ai_client = event.client
+            ai_session = self.client_sessions[ai_client.client_id]
+            ai_bundle = self.load_model(ai_session.model_name)
+            poses = split_action_text(ai_text_input.value)
+            if len(poses) < 2:
+                note = ai_client.add_notification(
+                    title="AI Keyframes",
+                    body="请至少描述两个姿势（用 然后/接着/最后 连接）")
+                import threading as _th
+                _th.Timer(6.0, lambda: note.remove()).start()
+                return
+            fps = ai_bundle.model_fps
+            total = int(ai_session.cur_duration * fps)
+            n = len(poses)
+            handle = ai_session.constraints["Full-Body"]
+            use_77 = handle.skeleton.nbjoints == 77
+            model_skel = getattr(ai_bundle.model, "skeleton", None)
+            skel_slice = model_skel.get_skel_slice(handle.skeleton) if use_77 and model_skel is not None else None
+            note = ai_client.add_notification(
+                title="AI Keyframes",
+                body=f"AI 生成 {n} 个关键姿势中…（约 1-3 分钟，请勿关闭页面）",
+                loading=True,
+                with_close_button=False)
+
+            import numpy as _np
+            import torch as _torch
+            import threading as _th
+            placed = []
+
+            def _work():
+                try:
+                    with _torch.no_grad():
+                        for i, ptext in enumerate(poses):
+                            nf = max(int(round(2.0 * fps)), 12)
+                            out = ai_bundle.model([ptext], [nf], constraint_lst=[],
+                                                  num_denoising_steps=100, num_samples=1,
+                                                  multi_prompt=True, num_transition_frames=5,
+                                                  post_processing=True, return_numpy=True)
+                            pj = _np.asarray(out["posed_joints"][0], dtype=_np.float64)
+                            diffs = _np.linalg.norm(pj - pj[0][None], axis=-1).mean(axis=-1)
+                            pose = pj[int(_np.argmax(diffs))]
+                            pelvis = pose[0][:3].copy()
+                            pose = pose - pelvis[None]
+                            pose[:, 2] += 1.1 * i
+                            frame = int(round((0.10 + 0.85 * i / max(n - 1, 1)) * (total - 1)))
+                            frame = min(total - 2, max(1, frame))
+                            if use_77 and skel_slice is not None:
+                                pos_i = pose[skel_slice]
+                                rot_i = _np.zeros((len(skel_slice), 3, 3))
+                            else:
+                                pos_i = pose
+                                rot_i = _np.zeros((pose.shape[0], 3, 3))
+                            handle.add_keyframe(
+                                f"ai_{i}_{frame}", frame,
+                                _torch.tensor(pos_i, dtype=_torch.float32),
+                                _torch.tensor(rot_i, dtype=_torch.float32))
+                            placed.append(f"frame {frame}: {ptext}")
+                    ai_client.add_notification(
+                        title="AI Keyframes",
+                        body="已放置 " + "；".join(placed))
+                except Exception as exc:
+                    ai_client.add_notification(
+                        title="AI Keyframes",
+                        body=f"AI 拆分失败: {exc}")
+                finally:
+                    note.remove()
+
+            _th.Thread(target=_work, daemon=True).start()
+
+        ai_button.on_click(_ai_place_keyframes)
 
     def on_client_connect(self, client: viser.ClientHandle) -> None:
         """Initialize GUI and state for each new client."""
