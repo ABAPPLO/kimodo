@@ -370,9 +370,6 @@ class Demo:
             total = int(ai_session.cur_duration * fps)
             n = len(poses)
             handle = ai_session.constraints["Full-Body"]
-            use_77 = handle.skeleton.nbjoints == 77
-            model_skel = getattr(ai_bundle.model, "skeleton", None)
-            skel_slice = model_skel.get_skel_slice(handle.skeleton) if use_77 and model_skel is not None else None
             note = ai_client.add_notification(
                 title="AI Keyframes",
                 body=f"AI 生成 {n} 个关键姿势中…（约 1-3 分钟，请勿关闭页面）",
@@ -396,17 +393,17 @@ class Demo:
                             pj = _np.asarray(out["posed_joints"][0], dtype=_np.float64)
                             diffs = _np.linalg.norm(pj - pj[0][None], axis=-1).mean(axis=-1)
                             pose = pj[int(_np.argmax(diffs))]
+                            # shift X/Z only — keep each pose's own height
                             pelvis = pose[0][:3].copy()
-                            pose = pose - pelvis[None]
+                            pose[:, [0, 2]] -= pelvis[[0, 2]]
                             pose[:, 2] += 1.1 * i
                             frame = int(round((0.10 + 0.85 * i / max(n - 1, 1)) * (total - 1)))
                             frame = min(total - 2, max(1, frame))
-                            if use_77 and skel_slice is not None:
-                                pos_i = pose[skel_slice]
-                                rot_i = _np.zeros((len(skel_slice), 3, 3))
-                            else:
-                                pos_i = pose
-                                rot_i = _np.zeros((pose.shape[0], 3, 3))
+                            # place the FULL 77-joint pose (session space);
+                            # compute_model_constraints_lst converts to model
+                            # joints (30) itself at generation time
+                            pos_i = pose
+                            rot_i = _np.zeros((pose.shape[0], 3, 3))
                             handle.add_keyframe(
                                 f"ai_{i}_{frame}", frame,
                                 _torch.tensor(pos_i, dtype=_torch.float32),
@@ -415,7 +412,33 @@ class Demo:
                     ai_client.add_notification(
                         title="AI Keyframes",
                         body="已放置 " + "；".join(placed))
+                    # auto-run the native Generate so the left viewport shows
+                    # the completed continuous motion through all keyframes
+                    note2 = ai_client.add_notification(
+                        title="AI Keyframes",
+                        body="正在生成连续动作…（左侧视口实时更新）",
+                        loading=True,
+                        with_close_button=False)
+                    try:
+                        import time as _time
+                        self._generation_lock.acquire()
+                        try:
+                            self.generate(
+                                client=ai_client,
+                                prompts=[ai_text_input.value],
+                                num_frames=[total],
+                                num_samples=1,
+                                seed=int(_time.time()) % 100000,
+                                diffusion_steps=100,
+                            )
+                        finally:
+                            self._generation_lock.release()
+                    finally:
+                        note2.remove()
                 except Exception as exc:
+                    import traceback as _tb
+                    with open("/home/applo/pose_chat/ai_fail.log", "a") as f:
+                        f.write(_tb.format_exc() + "\n=====\n")
                     ai_client.add_notification(
                         title="AI Keyframes",
                         body=f"AI 拆分失败: {exc}")
