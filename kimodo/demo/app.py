@@ -370,19 +370,27 @@ class Demo:
             total = int(ai_session.cur_duration * fps)
             n = len(poses)
             handle = ai_session.constraints["Full-Body"]
+            # clear stale keyframes from previous runs so the base-motion
+            # pass starts unconstrained (else "Only one motion allowed")
+            for f_old in list(handle.keyframes.keys()):
+                for kid_old in list(handle.frame2keyid.get(f_old, [])):
+                    handle.remove_keyframe(kid_old, f_old)
             note = ai_client.add_notification(
                 title="AI Keyframes",
-                body=f"AI 生成 {n} 个关键姿势中…（约 1-3 分钟，请勿关闭页面）",
+                body=f"AI 生成 {n} 个关键姿势中…（每个约 1-2 分钟）",
                 loading=True,
                 with_close_button=False)
 
             import numpy as _np
             import torch as _torch
             import threading as _th
-            placed = []
+            import time as _time
+            kf_data = []
 
             def _work():
                 try:
+                    # Phase 1: per-pose clip generations — extract keyframe
+                    # poses (77, session space) WITHOUT placing them yet
                     with _torch.no_grad():
                         for i, ptext in enumerate(poses):
                             nf = max(int(round(2.0 * fps)), 12)
@@ -399,42 +407,59 @@ class Demo:
                             pose[:, 2] += 1.1 * i
                             frame = int(round((0.10 + 0.85 * i / max(n - 1, 1)) * (total - 1)))
                             frame = min(total - 2, max(1, frame))
-                            # place the FULL 77-joint pose (session space);
-                            # compute_model_constraints_lst converts to model
-                            # joints (30) itself at generation time
-                            pos_i = pose
-                            rot_i = _np.zeros((pose.shape[0], 3, 3))
-                            handle.add_keyframe(
-                                f"ai_{i}_{frame}", frame,
-                                _torch.tensor(pos_i, dtype=_torch.float32),
-                                _torch.tensor(rot_i, dtype=_torch.float32))
-                            placed.append(f"frame {frame}: {ptext}")
-                    ai_client.add_notification(
-                        title="AI Keyframes",
-                        body="已放置 " + "；".join(placed))
-                    # auto-run the native Generate so the left viewport shows
-                    # the completed continuous motion through all keyframes
+                            kf_data.append((frame, pose))
                     note2 = ai_client.add_notification(
                         title="AI Keyframes",
-                        body="正在生成连续动作…（左侧视口实时更新）",
+                        body="正在生成基础动作…（约 1 分钟）",
+                        loading=True,
+                        with_close_button=False)
+
+                    # Phase 2: base motion FIRST — the constrained path
+                    # requires exactly one existing motion in the session.
+                    # NOTE: generate() manages _generation_lock internally
+                    # (non-blocking acquire + wait). Do NOT hold the lock
+                    # here — that self-deadlocks.
+                    try:
+                        self.generate(
+                            client=ai_client,
+                            prompts=[ai_text_input.value],
+                            num_frames=[total],
+                            num_samples=1,
+                            seed=int(_time.time()) % 100000,
+                            diffusion_steps=100,
+                        )
+                    finally:
+                        note2.remove()
+
+                    # Phase 3: place the keyframes on the Full-Body track
+                    for frame, pose in kf_data:
+                        handle.add_keyframe(
+                            f"ai_{frame}", frame,
+                            _torch.tensor(pose, dtype=_torch.float32),
+                            _torch.zeros((pose.shape[0], 3, 3), dtype=_torch.float32))
+                    placed = "；".join(f"frame {fr}: {_np.linalg.norm(pz[0]):.2f}" for fr, pz in kf_data)
+
+                    # Phase 4: constrained regeneration through all keyframes
+                    # (generate() acquires the lock itself — see Phase 2 note)
+                    note3 = ai_client.add_notification(
+                        title="AI Keyframes",
+                        body="正在按关键帧重新生成连续动作…",
                         loading=True,
                         with_close_button=False)
                     try:
-                        import time as _time
-                        self._generation_lock.acquire()
-                        try:
-                            self.generate(
-                                client=ai_client,
-                                prompts=[ai_text_input.value],
-                                num_frames=[total],
-                                num_samples=1,
-                                seed=int(_time.time()) % 100000,
-                                diffusion_steps=100,
-                            )
-                        finally:
-                            self._generation_lock.release()
+                        self.generate(
+                            client=ai_client,
+                            prompts=[ai_text_input.value],
+                            num_frames=[total],
+                            num_samples=1,
+                            seed=int(_time.time()) % 100000,
+                            diffusion_steps=100,
+                        )
                     finally:
-                        note2.remove()
+                        note3.remove()
+                    ai_client.add_notification(
+                        title="AI Keyframes",
+                        body="完成：关键帧已放置，连续动作已生成（见时间线与视口）")
                 except Exception as exc:
                     import traceback as _tb
                     with open("/home/applo/pose_chat/ai_fail.log", "a") as f:
@@ -443,7 +468,10 @@ class Demo:
                         title="AI Keyframes",
                         body=f"AI 拆分失败: {exc}")
                 finally:
-                    note.remove()
+                    try:
+                        note.remove()
+                    except Exception:
+                        pass
 
             _th.Thread(target=_work, daemon=True).start()
 
